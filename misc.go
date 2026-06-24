@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"go/build"
 	"html/template"
 	"io"
 	"net/http"
@@ -18,18 +20,26 @@ import (
 	"sync"
 )
 
-// validate validates if string s contains only characters in charset. validate is not a crypto related function so no need for constant time
+// customKeyCharSet is a pre-built lookup for O(k) key validation instead of O(k·n).
+var customKeyCharSet = func() map[rune]struct{} {
+	m := make(map[rune]struct{}, len([]rune(customKeyCharset)))
+	for _, r := range customKeyCharset {
+		m[r] = struct{}{}
+	}
+	return m
+}()
+
+// validate reports whether s contains only characters from customKeyCharset.
+// A trailing '~' (info-view suffix) is stripped before checking.
 func validate(s string) bool {
 	if len(s) == 0 {
 		return true
 	}
-
 	if s[len(s)-1] == '~' {
 		s = s[:len(s)-1]
 	}
-
 	for _, char := range s {
-		if !strings.Contains(customKeyCharset, string(char)) {
+		if _, ok := customKeyCharSet[char]; !ok {
 			return false
 		}
 	}
@@ -58,6 +68,7 @@ func initLinkLensDomain(domain string) {
 		FreeMap: make(map[string]bool),
 		Timeout: config.Clear1Duration,
 		Domain:  domain,
+		Type:    "len1",
 	}
 
 	domainLinkLens[domain].LinkLen2 = LinkLen{
@@ -66,6 +77,7 @@ func initLinkLensDomain(domain string) {
 		FreeMap: make(map[string]bool),
 		Timeout: config.Clear2Duration,
 		Domain:  domain,
+		Type:    "len2",
 	}
 
 	domainLinkLens[domain].LinkLen3 = LinkLen{
@@ -74,6 +86,7 @@ func initLinkLensDomain(domain string) {
 		FreeMap: make(map[string]bool),
 		Timeout: config.Clear3Duration,
 		Domain:  domain,
+		Type:    "len3",
 	}
 
 	domainLinkLens[domain].LinkCustom = LinkLen{
@@ -81,6 +94,7 @@ func initLinkLensDomain(domain string) {
 		LinkMap: make(map[string]*Link),
 		Timeout: config.ClearCustomLinksDuration,
 		Domain:  domain,
+		Type:    "custom",
 	}
 
 	domainLinkLens[domain].LinkLen1.Mutex.Lock()
@@ -104,7 +118,159 @@ func initLinkLensDomain(domain string) {
 	}
 }
 
+// lookupLink returns a snapshot copy of the Link and its owning LinkLen for the
+// given host+key. The copy is taken under the read lock, so callers may read any
+// field of the returned *Link without holding a lock. Returns (nil, ll) if the key
+// is not found (ll is still set so callers can pass it to recordAccess).
+func lookupLink(host, key string) (*Link, *LinkLen) {
+	dl, ok := domainLinkLens[host]
+	if !ok {
+		return nil, nil
+	}
+	var ll *LinkLen
+	switch keylen := len(key); {
+	case keylen == 1:
+		ll = &dl.LinkLen1
+	case keylen == 2:
+		ll = &dl.LinkLen2
+	case keylen == 3:
+		ll = &dl.LinkLen3
+	case keylen > 3 && keylen < maxKeyLen:
+		ll = &dl.LinkCustom
+	default:
+		return nil, nil
+	}
+	ll.Mutex.RLock()
+	lnkPtr := ll.LinkMap[key]
+	var snap Link
+	if lnkPtr != nil {
+		snap = *lnkPtr // copy while holding the read lock
+	}
+	ll.Mutex.RUnlock()
+	if lnkPtr == nil {
+		return nil, ll
+	}
+	return &snap, ll
+}
+
+// recordAccess increments AccessCount and, for limited-use links (Times > 0),
+// decrements Times under the write lock. If Times reaches zero the link is deleted
+// from the map but a snapshot is returned so the caller can serve the final response.
+// Returns nil if the link no longer exists (expired between lookupLink and now).
+func recordAccess(ll *LinkLen, key string) *Link {
+	ll.Mutex.Lock()
+	defer ll.Mutex.Unlock()
+	lnk, ok := ll.LinkMap[key]
+	if !ok {
+		return nil
+	}
+	lnk.AccessCount++
+	if lnk.Times > 0 {
+		lnk.Times--
+		if lnk.Times <= 0 {
+			snapshot := *lnk
+			delete(ll.LinkMap, key)
+			if ll.FreeMap != nil {
+				ll.FreeMap[key] = true
+			} else {
+				ll.Links--
+			}
+			domain, typ := ll.Domain, ll.Type
+			go deleteLinkFromDB(domain, typ, key)
+			return &snapshot
+		}
+	}
+	snapshot := *lnk
+	return &snapshot
+}
+
+// findExistingURL returns the first active, unlimited-use URL link that points
+// to targetURL for the given host, or nil if none exists.
+// Only unlimited links (Times == -1) are matched to avoid silently consuming uses.
+func findExistingURL(host, targetURL string) *Link {
+	dl, ok := domainLinkLens[host]
+	if !ok {
+		return nil
+	}
+	search := func(ll *LinkLen) *Link {
+		ll.Mutex.RLock()
+		defer ll.Mutex.RUnlock()
+		for _, lnk := range ll.LinkMap {
+			if lnk.LinkType == "url" && lnk.Data == targetURL && lnk.Times == -1 {
+				return lnk
+			}
+		}
+		return nil
+	}
+	if lnk := search(&dl.LinkLen1); lnk != nil {
+		return lnk
+	}
+	if lnk := search(&dl.LinkLen2); lnk != nil {
+		return lnk
+	}
+	if lnk := search(&dl.LinkLen3); lnk != nil {
+		return lnk
+	}
+	return search(&dl.LinkCustom)
+}
+
+var blocklist = make(map[string]struct{})
+
+// loadBlocklist populates the blocklist from the config's BlockedDomains list
+// and, if BlocklistFile is set, from a newline-delimited file (# comments OK).
+func loadBlocklist() {
+	for _, domain := range config.BlockedDomains {
+		blocklist[strings.ToLower(strings.TrimSpace(domain))] = struct{}{}
+	}
+	if config.BlocklistFile == "" {
+		return
+	}
+	data, err := os.ReadFile(config.BlocklistFile)
+	if err != nil {
+		if logger != nil {
+			logger.Println("Failed to load blocklist file:", err)
+		}
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.ToLower(strings.TrimSpace(line))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		blocklist[line] = struct{}{}
+	}
+	if logger != nil {
+		logger.Println("Loaded", len(blocklist), "entries into blocklist")
+	}
+}
+
+// isBlocklisted returns true if the hostname of rawURL (or any parent domain)
+// appears in the blocklist.
+func isBlocklisted(rawURL string) bool {
+	if len(blocklist) == 0 {
+		return false
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for host != "" {
+		if _, blocked := blocklist[host]; blocked {
+			return true
+		}
+		idx := strings.IndexByte(host, '.')
+		if idx < 0 {
+			break
+		}
+		host = host[idx+1:]
+	}
+	return false
+}
+
 func addHeaders(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("X-Content-Type-Options", "nosniff")
+	w.Header().Add("Referrer-Policy", "no-referrer")
 	if config.ReportTo != "" {
 		w.Header().Add("Report-To", strings.ReplaceAll(config.ReportTo, "###DomainNames###", r.Host))
 	}
@@ -151,27 +317,28 @@ func findFolderDefaultLocations(folder string) (path string) {
 	if _, err := os.Stat(filepath.Join(".", folder)); !os.IsNotExist(err) {
 		return filepath.Join(".", folder)
 	}
-	possibleDirs := os.Getenv("GOPATH")
-	if possibleDirs == "" {
-		possibleDirs = build.Default.GOPATH
-	}
-	var dirs []string
-	if runtime.GOOS == "windows" {
-		dirs = strings.Split(possibleDirs, ";")
-	} else {
-		dirs = strings.Split(possibleDirs, ":")
-	}
-	for _, dir := range dirs {
-		if _, err := os.Stat(filepath.Join(dir, "src", "github.com", "7i", "shorter", folder)); !os.IsNotExist(err) {
-			// Found
-			return filepath.Join(dir, "src", "github.com", "7i", "shorter", folder)
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		// Fallback: use the default GOPATH convention ($HOME/go).
+		if home, err := os.UserHomeDir(); err == nil {
+			gopath = filepath.Join(home, "go")
 		}
 	}
-
+	sep := ":"
+	if runtime.GOOS == "windows" {
+		sep = ";"
+	}
+	for _, dir := range strings.Split(gopath, sep) {
+		candidate := filepath.Join(dir, "src", "github.com", "7i", "shorter", folder)
+		if _, err := os.Stat(candidate); !os.IsNotExist(err) {
+			return candidate
+		}
+	}
 	return ""
 }
 
-func compress(data string) (compressedData string, err error) {
+// compress gzips data and returns it base64-encoded so it is safe for JSON storage.
+func compress(data string) (string, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	if _, err := io.Copy(zw, strings.NewReader(data)); err != nil {
@@ -180,41 +347,54 @@ func compress(data string) (compressedData string, err error) {
 	if err := zw.Close(); err != nil {
 		return "", err
 	}
-	return buf.String(), nil
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
-func decompress(data string) (decompressedData string, err error) {
-	var buf bytes.Buffer
-	zw, err := gzip.NewReader(strings.NewReader(data))
+// decompress decodes a base64-encoded gzip payload produced by compress().
+// Returns an error if the decompressed size exceeds maxDecompressedSize.
+func decompress(data string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(&buf, zw); err != nil {
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
 		return "", err
 	}
-	if err := zw.Close(); err != nil {
+	var buf bytes.Buffer
+	if _, err = io.Copy(&buf, io.LimitReader(zr, maxDecompressedSize+1)); err != nil {
 		return "", err
+	}
+	if err = zr.Close(); err != nil {
+		return "", err
+	}
+	if int64(buf.Len()) > maxDecompressedSize {
+		return "", errors.New("decompressed size exceeds limit")
 	}
 	return buf.String(), nil
 }
 
 func returnDecompressed(lnk *Link, w http.ResponseWriter, r *http.Request) {
 	if lnk == nil {
-		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: invalid lnk in request to returnDecompressed().")
+		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: nil lnk in returnDecompressed")
 		return
 	}
-	dataReader, err := gzip.NewReader(strings.NewReader(lnk.Data))
-	if err == nil {
-		fmt.Println("ERROR in lnk.Data, misc.go line 203", lnk.Data) // DEBUG
-		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: invalid lnk.Data in request to returnDecompressed().")
+	raw, err := base64.StdEncoding.DecodeString(lnk.Data)
+	if err != nil {
+		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: base64 decode failed in returnDecompressed")
 		return
 	}
-	if _, err = io.Copy(w, dataReader); err != nil {
-		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: while decompresing in request to returnDecompressed().")
+	dataReader, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: gzip open failed in returnDecompressed")
+		return
+	}
+	if _, err = io.Copy(w, io.LimitReader(dataReader, maxDecompressedSize+1)); err != nil {
+		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: decompression failed in returnDecompressed")
 		return
 	}
 	if err = dataReader.Close(); err != nil {
-		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: closing dataReader in request to returnDecompressed().")
+		logErrors(w, r, errServerError, http.StatusInternalServerError, "Error: closing dataReader in returnDecompressed")
 		return
 	}
 	logOK(r, http.StatusOK)
@@ -234,50 +414,63 @@ func logOK(r *http.Request, statusCode int) {
 	}
 }
 
-// fugly temp function
+// listActiveLinks serves the admin link-list endpoint.
+// Authentication uses HTTP Basic Auth; the password is sha256(password+Salt) == HashSHA256.
 func listActiveLinks(w http.ResponseWriter, r *http.Request) {
-	ba := sha256.Sum256([]byte(r.URL.RawQuery + config.Salt))
-	pwd := hex.EncodeToString(ba[:])
-	if pwd == config.HashSHA256 {
+	_, password, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="shorter admin"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	ba := sha256.Sum256([]byte(password + config.Salt))
+	computed := hex.EncodeToString(ba[:])
+	if subtle.ConstantTimeCompare([]byte(computed), []byte(config.HashSHA256)) == 1 {
 		w.Header().Add("Content-Type", "text/plain")
-		resp := ""
 		for _, domain := range config.DomainNames {
-			resp += "Domain: " + domain + "\n"
-			resp += "Linklen 1:\n"
-			resp += getActiveList(&domainLinkLens[domain].LinkLen1)
-			resp += "Linklen 2:\n"
-			resp += getActiveList(&domainLinkLens[domain].LinkLen2)
-			resp += "Linklen 3:\n"
-			resp += getActiveList(&domainLinkLens[domain].LinkLen3)
-			resp += "Custome Links:\n"
-			resp += getActiveList(&domainLinkLens[domain].LinkCustom)
+			fmt.Fprintf(w, "Domain: %s\nLinklen 1:\n%sLinklen 2:\n%sLinklen 3:\n%sCustom Links:\n%s",
+				domain,
+				getActiveList(&domainLinkLens[domain].LinkLen1),
+				getActiveList(&domainLinkLens[domain].LinkLen2),
+				getActiveList(&domainLinkLens[domain].LinkLen3),
+				getActiveList(&domainLinkLens[domain].LinkCustom),
+			)
 		}
-
-		fmt.Fprint(w, resp)
 	} else {
-		http.Error(w, errServerError, http.StatusInternalServerError)
+		w.Header().Set("WWW-Authenticate", `Basic realm="shorter admin"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	}
 }
 
-func getActiveList(l *LinkLen) (resp string) {
-	l.Mutex.Lock()
-	next := *l.NextClear
-	stop := false
-	for !stop {
-		resp += "Domain: " + l.Domain + " Key: " + next.Key + " LinkType: " + next.LinkType + " IsCompressed: " + fmt.Sprintf("%v", next.IsCompressed) + "Timeout:" + next.Timeout.String() + "Data: "
-		if next.IsCompressed {
-			resp += url.QueryEscape(next.Data) + "\n"
-		} else {
-			resp += next.Data + "\n"
-		}
-		if next.NextClear != nil {
-			next = *next.NextClear
-		} else {
-			stop = true
-		}
+func getActiveList(l *LinkLen) string {
+	l.Mutex.RLock()
+	defer l.Mutex.RUnlock()
+	if l.NextClear == nil {
+		return ""
 	}
-	l.Mutex.Unlock()
-	return
+	var sb strings.Builder
+	next := l.NextClear
+	for next != nil {
+		sb.WriteString("Domain: ")
+		sb.WriteString(l.Domain)
+		sb.WriteString(" Key: ")
+		sb.WriteString(next.Key)
+		sb.WriteString(" LinkType: ")
+		sb.WriteString(next.LinkType)
+		sb.WriteString(" IsCompressed: ")
+		sb.WriteString(fmt.Sprintf("%v", next.IsCompressed))
+		sb.WriteString(" Timeout: ")
+		sb.WriteString(next.Timeout.String())
+		sb.WriteString(" Data: ")
+		if next.IsCompressed {
+			sb.WriteString("<compressed>\n")
+		} else {
+			sb.WriteString(url.QueryEscape(next.Data))
+			sb.WriteByte('\n')
+		}
+		next = next.NextClear
+	}
+	return sb.String()
 }
 
 func initTemplates() {
@@ -305,7 +498,9 @@ func loadTemplate(templateName, defaultTmplStr string) {
 			}
 			templateMap[domain+"#"+templateName] = defaultTmpl
 		} else {
-			logger.Println("Template key value: ", domain+"#"+templateName)
+			if logger != nil {
+				logger.Println("Template key value: ", domain+"#"+templateName)
+			}
 			templateMap[domain+"#"+templateName] = tmpl
 		}
 	}

@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -21,7 +20,7 @@ func main() {
 	var err error
 	// accept if we specify the path to the config directly without a flag, e.g. shorter /path/to/config
 	if len(os.Args) == 2 {
-		conf, err = ioutil.ReadFile(os.Args[1])
+		conf, err = os.ReadFile(os.Args[1])
 		if err != nil {
 			log.Fatalln("Invalid config file:\n", err)
 		}
@@ -30,11 +29,11 @@ func main() {
 		var confFile string // confDir specifies the path to config file.
 		flag.StringVar(&confFile, "config", filepath.Join(".", "config"), "path to the config file")
 		flag.Parse()
-		conf, err = ioutil.ReadFile(confFile)
+		conf, err = os.ReadFile(confFile)
 		if err != nil {
 			configPath := findFolderDefaultLocations("shorterdata")
 			if configPath != "" {
-				conf, err = ioutil.ReadFile(filepath.Join(configPath, "config"))
+				conf, err = os.ReadFile(filepath.Join(configPath, "config"))
 				if err != nil {
 					log.Fatalln("Invalid config file:\n", err)
 				}
@@ -81,8 +80,12 @@ func main() {
 			logger = nil
 		} else {
 			defer f.Close()
-			// Write out server config on startup if logging is enabled
-			f.WriteString("Loaded config:\n" + fmt.Sprintf("%# v", pretty.Formatter(config)) + "\nLog Separator: " + logSep + "\n")
+			// Write out server config on startup if logging is enabled.
+			// Sensitive fields are redacted so the log file cannot be used to derive credentials.
+			logConfig := config
+			logConfig.Salt = "[REDACTED]"
+			logConfig.HashSHA256 = "[REDACTED]"
+			f.WriteString("Loaded config:\n" + fmt.Sprintf("%# v", pretty.Formatter(logConfig)) + "\nLog Separator: " + logSep + "\n")
 			logger = log.New(f, logSep+"\n", log.LstdFlags)
 		}
 	}
@@ -90,14 +93,9 @@ func main() {
 	// init linkLen1, linkLen2, linkLen3 and fill each freeMap with all valid keys for each len. Defined in misc.go
 	initLinkLens()
 
-	// TODO: find better solution, maybe waitgroup so all TimeoutManager have started before starting the server
-	time.Sleep(time.Millisecond * 500)
+	loadBlocklist()
 
 	setupDB()
-	go BackupRoutine()
-
-	// TODO: find better solution, maybe waitgroup
-	time.Sleep(time.Millisecond * 500)
 
 	initTemplates()
 
@@ -106,6 +104,8 @@ func main() {
 	handleCSS(mux)    // defined in handlers.go
 	handleImages(mux) // defined in handlers.go
 	handleRobots(mux) // defined in handlers.go
+	handleQR(mux)     // defined in qr.go
+	handleAPI(mux)    // defined in api.go
 	handleRoot(mux)   // defined in handlers.go
 
 	// Start server
@@ -114,7 +114,14 @@ func main() {
 	}
 	// if NoTLS is set only start a http server
 	if config.NoTLS {
-		log.Fatalln(http.ListenAndServe(config.AddressPort, mux))
+		srv := &http.Server{
+			Addr:         config.AddressPort,
+			Handler:      mux,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 30 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
+		log.Fatalln(srv.ListenAndServe())
 	}
 	server := getServer(mux) // defined in letsencrypt.go
 	// Using LetsEncrypt, no premade cert and key files needed

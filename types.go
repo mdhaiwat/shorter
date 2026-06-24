@@ -55,6 +55,10 @@ type Config struct {
 	Email string `yaml:"Email"`
 	// StaticLinks contains a list of static keys that will no time out
 	StaticLinks map[string]string `yaml:"StaticLinks"`
+	// BlockedDomains lists hostnames (and their subdomains) that may not be shortened
+	BlockedDomains []string `yaml:"BlockedDomains"`
+	// BlocklistFile is an optional path to a newline-delimited file of blocked domains
+	BlocklistFile string `yaml:"BlocklistFile"`
 	// Salt is used as the Salt for the password for special requests
 	Salt string `yaml:"Salt"`
 	// HashSHA256 is the sha256 hash of the password and Salt used for special requests
@@ -74,6 +78,7 @@ type Link struct {
 	Data         string    `json:"Data"`
 	IsCompressed bool      `json:"IsCompressed"`
 	Times        int       `json:"Times"`
+	AccessCount  int64     `json:"AccessCount"`
 	Timeout      time.Time `json:"Timeout"`
 	NextClear    *Link     `json:"NextClear"`
 }
@@ -87,6 +92,7 @@ type LinkLen struct {
 	EndClear  *Link            `json:"EndClear"`  // last element in linked list
 	Timeout   time.Duration    `json:"Timeout"`
 	Domain    string           `json:"Domain"`
+	Type      string           `json:"Type"` // bbolt bucket name: "len1","len2","len3","custom"
 }
 
 type LinkLens struct {
@@ -118,11 +124,18 @@ func (l *LinkLen) Add(lnk *Link) (key string, err error) {
 	isCustomLink := false
 	if l.FreeMap == nil {
 		if len(lnk.Key) < 4 || len(lnk.Key) >= maxKeyLen || !validate(lnk.Key) {
-			logger.Println("AddKey: invalid parameter key, key can only be > 4 or < " + strconv.Itoa(maxKeyLen))
+			if logger != nil {
+				logger.Println("AddKey: invalid key length or charset, key:", url.QueryEscape(lnk.Key))
+			}
 			return "", errors.New("Error: key can only be of length > 4 and < " + strconv.Itoa(maxKeyLen) + " and only use the following characters:\n" + customKeyCharset)
 		}
 		isCustomLink = true
 		key = lnk.Key
+		// Authoritative duplicate check under the write lock, preventing the data race
+		// that would occur if callers checked LinkMap before acquiring the lock.
+		if _, exists := l.LinkMap[key]; exists {
+			return "", errors.New(errInvalidKeyUsed)
+		}
 	}
 
 	// Formatted output for the log
@@ -208,6 +221,12 @@ func (l *LinkLen) Add(lnk *Link) (key string, err error) {
 		logstr = append(logstr, "\n   Added key:"+url.QueryEscape(key)+"\n   l.NextClear.Key: "+url.QueryEscape(l.NextClear.Key)+"\n   l.EndClear.Key: "+url.QueryEscape(l.EndClear.Key))
 		logger.Println(strings.Join(logstr, ""))
 	}
+	// Snapshot lnk while still holding the write lock so the goroutine
+	// doesn't race with a concurrent recordAccess or Add() on lnk's fields.
+	lnkSnap := *lnk
+	lnkSnap.NextClear = nil
+	domain, typ := l.Domain, l.Type
+	go saveLinkToDB(domain, typ, &lnkSnap)
 	return key, nil
 }
 
@@ -250,20 +269,19 @@ func (l *LinkLen) TimeoutManager() {
 			}
 			delete(l.LinkMap, keyToClear)
 			if l.FreeMap != nil {
-				// Links of specific length
 				l.FreeMap[keyToClear] = true
 				if logger != nil {
 					logger.Println("Finished clearing nextClear of length:", len(keyToClear), "\ncurrently using:", len(l.LinkMap), "keys\ncurrent free keys:", len(l.FreeMap))
 				}
 			} else {
-				// Custom links
 				l.Links--
 				if logger != nil {
 					logger.Println("Finished clearing nextClear for custom link\ncurrently using:", l.Links, "keys\ncurrent free keys:", config.MaxCustomLinks-l.Links)
 				}
 			}
-
+			domain, typ := l.Domain, l.Type
 			l.Mutex.Unlock()
+			go deleteLinkFromDB(domain, typ, keyToClear)
 			l.Mutex.RLock()
 		}
 		l.Mutex.RUnlock()

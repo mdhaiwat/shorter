@@ -3,286 +3,208 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
-	"io/ioutil"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
+
+	bbolt "go.etcd.io/bbolt"
 )
 
-// Fugly solution, TODO switch to real DB like bolt
+var linkLenTypes = []string{"len1", "len2", "len3", "custom"}
+
+// setupDB opens (or creates) the bbolt database, prunes expired entries, and
+// restores surviving links into memory. Falls back to legacy gob files if the
+// database cannot be opened.
 func setupDB() {
+	if logger != nil {
+		logger.Println("Opening bbolt database")
+	}
+
+	dbPath := filepath.Join(config.BaseDir, "shorter.db")
+	var err error
+	boltDB, err = bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 2 * time.Second})
+	if err != nil {
+		if logger != nil {
+			logger.Println("Failed to open bbolt DB, falling back to gob backup:", err)
+		}
+		for _, domain := range config.DomainNames {
+			restoreGob(&domainLinkLens[domain].LinkLen1, "len1", domain)
+			restoreGob(&domainLinkLens[domain].LinkLen2, "len2", domain)
+			restoreGob(&domainLinkLens[domain].LinkLen3, "len3", domain)
+			restoreGob(&domainLinkLens[domain].LinkCustom, "custom", domain)
+		}
+		return
+	}
+
+	// Ensure all domain/type buckets exist.
+	if err = boltDB.Update(func(tx *bbolt.Tx) error {
+		for _, domain := range config.DomainNames {
+			b, err := tx.CreateBucketIfNotExists([]byte(domain))
+			if err != nil {
+				return err
+			}
+			for _, t := range linkLenTypes {
+				if _, err = b.CreateBucketIfNotExists([]byte(t)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil && logger != nil {
+		logger.Println("Failed to create bbolt buckets:", err)
+	}
+
+	// Restore links, pruning any that have already expired.
+	now := time.Now()
+	boltDB.Update(func(tx *bbolt.Tx) error {
+		for _, domain := range config.DomainNames {
+			b := tx.Bucket([]byte(domain))
+			if b == nil {
+				return nil
+			}
+			for _, typ := range linkLenTypes {
+				tb := b.Bucket([]byte(typ))
+				if tb == nil {
+					continue
+				}
+				ll := llForType(domain, typ)
+
+				var active []Link
+				var toDelete [][]byte
+
+				tb.ForEach(func(k, v []byte) error {
+					var lnk Link
+					if json.Unmarshal(v, &lnk) != nil {
+						toDelete = append(toDelete, append([]byte(nil), k...))
+						return nil
+					}
+					if !lnk.Timeout.After(now) {
+						toDelete = append(toDelete, append([]byte(nil), k...))
+						return nil
+					}
+					active = append(active, lnk)
+					return nil
+				})
+				for _, k := range toDelete {
+					tb.Delete(k)
+				}
+
+				// Sort ascending by Timeout so NextClear linked list stays ordered.
+				sort.Slice(active, func(i, j int) bool {
+					return active[i].Timeout.Before(active[j].Timeout)
+				})
+				for i := range active {
+					restoreLinkToMemory(ll, &active[i])
+				}
+			}
+		}
+		return nil
+	})
 
 	if logger != nil {
-		logger.Println("Reading in links and data from db")
-	}
-	for _, domain := range config.DomainNames {
-		restoreLinkLen(&domainLinkLens[domain].LinkLen1, "len1", domain)
-		restoreLinkLen(&domainLinkLens[domain].LinkLen2, "len2", domain)
-		restoreLinkLen(&domainLinkLens[domain].LinkLen3, "len3", domain)
-		restoreLinkLen(&domainLinkLens[domain].LinkCustom, "custom", domain)
+		logger.Println("bbolt restore complete")
 	}
 }
 
-func restoreLinkLen(l *LinkLen, typ, domain string) {
-	var backupLinkLen []Link
-	fileName := "backupdb-" + domain + "-" + typ + ".gob"
+func llForType(domain, typ string) *LinkLen {
+	switch typ {
+	case "len1":
+		return &domainLinkLens[domain].LinkLen1
+	case "len2":
+		return &domainLinkLens[domain].LinkLen2
+	case "len3":
+		return &domainLinkLens[domain].LinkLen3
+	default:
+		return &domainLinkLens[domain].LinkCustom
+	}
+}
 
-	d, err := ioutil.ReadFile(filepath.Join(config.BaseDir, domain, fileName))
-	if err != nil && logger != nil {
-		logger.Println(err, "ReadFile - Skipping "+fileName)
+// restoreLinkToMemory inserts lnk directly into ll's in-memory structures
+// without triggering a DB write. Links must be inserted in ascending Timeout order.
+func restoreLinkToMemory(l *LinkLen, lnk *Link) {
+	lnk.NextClear = nil
+	l.LinkMap[lnk.Key] = lnk
+	if l.FreeMap != nil {
+		delete(l.FreeMap, lnk.Key)
 	} else {
-		buf := bytes.NewBuffer(d)
-		dec := gob.NewDecoder(buf)
-		err := dec.Decode(&backupLinkLen)
-		if err != nil && logger != nil {
-			logger.Println(err, "Unmarshal - Skipping"+fileName)
-		} else {
-			if len(backupLinkLen) > 0 && backupLinkLen[0].Key != "" {
-				l.NextClear = &backupLinkLen[0]
-				l.EndClear = &backupLinkLen[len(backupLinkLen)-1]
-				l.Links = len(backupLinkLen)
-				l.LinkMap[backupLinkLen[0].Key] = &backupLinkLen[0]
-				delete(l.FreeMap, backupLinkLen[0].Key)
-			}
-			for i := 1; i < len(backupLinkLen); i++ {
-				if backupLinkLen[i].Key != "" {
-					l.LinkMap[backupLinkLen[i].Key] = &backupLinkLen[i]
-					backupLinkLen[i-1].NextClear = &backupLinkLen[i]
-					delete(l.FreeMap, backupLinkLen[i].Key)
-				}
-			}
-		}
-	}
-}
-
-// part 2 of the fugly solution
-func BackupRoutine() {
-
-	for {
-		time.Sleep(time.Minute * 30)
-
-		for _, domain := range config.DomainNames {
-			saveBackup(&domainLinkLens[domain].LinkLen1, "len1", domain)
-			saveBackup(&domainLinkLens[domain].LinkLen2, "len2", domain)
-			saveBackup(&domainLinkLens[domain].LinkLen3, "len3", domain)
-			saveBackup(&domainLinkLens[domain].LinkCustom, "custom", domain)
-		}
-
-		logger.Println("Finished saving new backup")
-	}
-}
-
-func saveBackup(l *LinkLen, typ, domain string) {
-	var err error
-	var backupLinkLen []Link
-	filename := "backupdb-" + domain + "-" + typ + ".gob"
-
-	if l == nil {
-		logger.Println("*LinkLen is nil, skipping ", filename)
-		return
+		l.Links++
 	}
 	if l.NextClear == nil {
-		logger.Println("l.NextClear is nil, skipping ", filename)
+		l.NextClear = lnk
+		l.EndClear = lnk
+	} else {
+		l.EndClear.NextClear = lnk
+		l.EndClear = lnk
+	}
+}
+
+// saveLinkToDB persists lnk to bbolt. Called after a successful Add(), outside
+// the LinkLen mutex so it doesn't block readers.
+func saveLinkToDB(domain, typ string, lnk *Link) {
+	if boltDB == nil {
 		return
 	}
-
-	l.Mutex.Lock()
-
-	next := *l.NextClear
-
-	stop := false
-	for !stop {
-		backupLinkLen = append(backupLinkLen, next)
-		if next.NextClear != nil {
-			next = *next.NextClear
-		} else {
-			stop = true
-		}
-	}
-	l.Mutex.Unlock()
-
-	var backupBuffer bytes.Buffer
-	enc := gob.NewEncoder(&backupBuffer)
-	err = enc.Encode(backupLinkLen)
+	data, err := json.Marshal(lnk)
 	if err != nil {
-		logger.Println(err, "Error while saving backup in enc.Encode()")
+		if logger != nil {
+			logger.Println("saveLinkToDB marshal error:", err)
+		}
+		return
 	}
-
-	backupLinkLen = nil
-
-	if err = os.WriteFile(filepath.Join(config.BaseDir, domain, filename), backupBuffer.Bytes(), 0644); err != nil && logger != nil {
-		logger.Println(err, "failed to save DB")
-	}
-
-	logger.Println("Backed up:", filename)
-}
-
-// New BoltDB restore
-//startRestoreDB(&domainLinkLens[domain].LinkLen1, domain, "linkLen1")
-//startRestoreDB(&domainLinkLens[domain].LinkLen2, domain, "linkLen2")
-//startRestoreDB(&domainLinkLens[domain].LinkLen3, domain, "linkLen3")
-//startRestoreDB(&domainLinkLens[domain].LinkCustom, domain, "linkCustom")
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-// new bolt implementation of backup ============
-// Config2 type
-
-/*
-type Config2 struct {
-	Height   float64   `json:"height"`
-	Birthday time.Time `json:"birthday"`
-}
-
-// Entry type
-type Entry struct {
-	Calories int    `json:"calories"`
-	Food     string `json:"food"`
-}
-
-func startRestoreDB(l *LinkLen, domain, linkLen string) {
-	db := setupDB2(domain)
-	defer db.Close()
-	restoreDBLinkLen(db, domain)
-}
-
-// restoreDBLinkLen will read out all links for all linkLen from the bolt.DB for the specified domain and populate the domainLinkLens map
-func restoreDBLinkLen(db *bolt.DB, domain string) {
-	err := db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(domain)).Bucket([]byte("linkLen1"))
-		b.ForEach(func(k, v []byte) error {
-			// TODO Restore entries from DB HERE
-
-			var lnk Link
-			err := json.Unmarshal(v, &lnk)
-			if err != nil {
-				logger.Fatalln("Unable to restore link,", err)
-			}
-			l1 := &domainLinkLens[domain].LinkLen1
-
-			l1.Add(&lnk)
-
-
-
-			if len(backupLinkLen) > 0 && backupLinkLen[0].Key != "" {
-				l.NextClear = &backupLinkLen[0]
-				l.EndClear = &backupLinkLen[len(backupLinkLen)-1]
-				l.Links = len(backupLinkLen)
-				l.LinkMap[backupLinkLen[0].Key] = &backupLinkLen[0]
-				delete(l.FreeMap, backupLinkLen[0].Key)
-			}
-			for i := 1; i < len(backupLinkLen); i++ {
-				if backupLinkLen[i].Key != "" {
-					l.LinkMap[backupLinkLen[i].Key] = &backupLinkLen[i]
-					backupLinkLen[i-1].NextClear = &backupLinkLen[i]
-					delete(l.FreeMap, backupLinkLen[i].Key)
-				}
-			}
-
-			fmt.Println(string(k), string(v))
+	if err = boltDB.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(domain))
+		if b == nil {
 			return nil
-		})
-		return nil
-	})
+		}
+		return b.Bucket([]byte(typ)).Put([]byte(lnk.Key), data)
+	}); err != nil && logger != nil {
+		logger.Println("saveLinkToDB write error:", err)
+	}
+}
+
+// deleteLinkFromDB removes a key from bbolt. Called by TimeoutManager when a
+// link expires and by recordAccess when Times reaches zero.
+func deleteLinkFromDB(domain, typ, key string) {
+	if boltDB == nil {
+		return
+	}
+	if err := boltDB.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(domain))
+		if b == nil {
+			return nil
+		}
+		return b.Bucket([]byte(typ)).Delete([]byte(key))
+	}); err != nil && logger != nil {
+		logger.Println("deleteLinkFromDB error:", err)
+	}
+}
+
+// restoreGob is the legacy fallback: restores links from a gob backup file.
+func restoreGob(l *LinkLen, typ, domain string) {
+	fileName := "backupdb-" + domain + "-" + typ + ".gob"
+	d, err := os.ReadFile(filepath.Join(config.BaseDir, domain, fileName))
 	if err != nil {
-		log.Fatal(err)
+		if logger != nil {
+			logger.Println(err, "restoreGob - skipping "+fileName)
+		}
+		return
 	}
-}
-
-func setupDB2(domain string) *bolt.DB {
-
-	db, err := bolt.Open(filepath.Join(config.BaseDir, domain, domain+".db"), 0600, nil)
-
-	if err != nil && logger != nil {
-		logger.Fatalln("could not open db,", err)
+	var links []Link
+	if err = gob.NewDecoder(bytes.NewBuffer(d)).Decode(&links); err != nil {
+		if logger != nil {
+			logger.Println(err, "restoreGob - decode error "+fileName)
+		}
+		return
 	}
-	err = db.Update(func(tx *bolt.Tx) error {
-		root, err := tx.CreateBucketIfNotExists([]byte(domain))
-		if err != nil {
-			logger.Fatalln("could not create root bucket:", err)
-		}
-		_, err = root.CreateBucketIfNotExists([]byte("linkLen1"))
-		if err != nil {
-			logger.Fatalln("could not create linkLen1 bucket:", err)
-		}
-		_, err = root.CreateBucketIfNotExists([]byte("linkLen2"))
-		if err != nil {
-			logger.Fatalln("could not create linkLen2 bucket:", err)
-		}
-		_, err = root.CreateBucketIfNotExists([]byte("linkLen3"))
-		if err != nil {
-			logger.Fatalln("could not create linkLen3 bucket:", err)
-		}
-		_, err = root.CreateBucketIfNotExists([]byte("linkCustom"))
-		if err != nil {
-			logger.Fatalln("could not create linkCustom bucket:", err)
-		}
-		return nil
+	now := time.Now()
+	sort.Slice(links, func(i, j int) bool {
+		return links[i].Timeout.Before(links[j].Timeout)
 	})
-	if err != nil {
-		logger.Fatalln("could not set up buckets,", err)
-	}
-	logger.Println("")
-	fmt.Println("DB Setup for", domain, "Done")
-	return db
-}
-
-func setConfig2(db *bolt.DB, Config2 Config2) error {
-	confBytes, err := json.Marshal(Config2)
-	if err != nil {
-		return fmt.Errorf("could not marshal Config2 json: %v", err)
-	}
-	err = db.Update(func(tx *bolt.Tx) error {
-		err = tx.Bucket([]byte("DB")).Put([]byte("CONFIG"), confBytes)
-		if err != nil {
-			return fmt.Errorf("could not set Config2: %v", err)
+	for i := range links {
+		if links[i].Key != "" && links[i].Timeout.After(now) {
+			restoreLinkToMemory(l, &links[i])
 		}
-		return nil
-	})
-	fmt.Println("Set Config2")
-	return err
-}
-
-func addWeight(db *bolt.DB, weight string, date time.Time) error {
-	err := db.Update(func(tx *bolt.Tx) error {
-		err := tx.Bucket([]byte("DB")).Bucket([]byte("WEIGHT")).Put([]byte(date.Format(time.RFC3339)), []byte(weight))
-		if err != nil {
-			return fmt.Errorf("could not insert weight: %v", err)
-		}
-		return nil
-	})
-	fmt.Println("Added Weight")
-	return err
-}
-
-func addEntry(db *bolt.DB, calories int, food string, date time.Time) error {
-	entry := Entry{Calories: calories, Food: food}
-	entryBytes, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("could not marshal entry json: %v", err)
 	}
-	err = db.Update(func(tx *bolt.Tx) error {
-		err := tx.Bucket([]byte("DB")).Bucket([]byte("ENTRIES")).Put([]byte(date.Format(time.RFC3339)), entryBytes)
-		if err != nil {
-			return fmt.Errorf("could not insert entry: %v", err)
-		}
-
-		return nil
-	})
-	fmt.Println("Added Entry")
-	return err
 }
-*/
